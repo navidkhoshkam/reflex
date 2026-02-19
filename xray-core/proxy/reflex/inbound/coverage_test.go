@@ -6,6 +6,7 @@ import (
 	"context"
 	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -20,10 +21,38 @@ import (
 )
 
 type bufferConn struct {
-	bytes.Buffer
+	mu  sync.Mutex
+	buf bytes.Buffer
 }
 
-func (c *bufferConn) Read(_ []byte) (int, error)        { return 0, io.EOF }
+func (c *bufferConn) Read(_ []byte) (int, error) { return 0, io.EOF }
+
+func (c *bufferConn) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.buf.Write(p)
+}
+
+func (c *bufferConn) Bytes() []byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]byte, c.buf.Len())
+	copy(out, c.buf.Bytes())
+	return out
+}
+
+func (c *bufferConn) Len() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.buf.Len()
+}
+
+func (c *bufferConn) String() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.buf.String()
+}
+
 func (c *bufferConn) Close() error                       { return nil }
 func (c *bufferConn) LocalAddr() net.Addr                { return &net.TCPAddr{} }
 func (c *bufferConn) RemoteAddr() net.Addr               { return &net.TCPAddr{} }
