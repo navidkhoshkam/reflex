@@ -2,11 +2,13 @@ package inbound
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/binary"
 	"io"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -315,6 +317,126 @@ func TestIsHTTPPostLike(t *testing.T) {
 	shortData := []byte("POS")
 	if handler.isHTTPPostLike(shortData) {
 		t.Fatal("should not detect POST in short data")
+	}
+}
+
+func TestProcessHandshakeSuccessWithEOF(t *testing.T) {
+	h := createTestHandler()
+	validUserID := uuid.MustParse(h.clients[0].Account.(*MemoryAccount).Id)
+	clientHS, err := createClientHandshake(validUserID)
+	if err != nil {
+		t.Fatalf("failed to create client handshake: %v", err)
+	}
+
+	conn := &bufferConn{}
+	err = h.processHandshake(
+		bufio.NewReader(bytes.NewReader(nil)),
+		conn,
+		&testDispatcher{},
+		context.Background(),
+		clientHS,
+	)
+	if err != nil {
+		t.Fatalf("expected successful handshake path, got: %v", err)
+	}
+	if !strings.Contains(conn.String(), "HTTP/1.1 200 OK") {
+		t.Fatal("expected HTTP success response to be written")
+	}
+}
+
+func TestHandleReflexMagicRejectsInvalidTimestamp(t *testing.T) {
+	h := createTestHandler()
+	validUserID := uuid.MustParse(h.clients[0].Account.(*MemoryAccount).Id)
+	clientHS, err := createClientHandshake(validUserID)
+	if err != nil {
+		t.Fatalf("failed to create client handshake: %v", err)
+	}
+	clientHS.Timestamp = time.Now().Unix() - 601
+
+	var packet bytes.Buffer
+	if err := writeClientHandshake(&packet, clientHS); err != nil {
+		t.Fatalf("failed to serialize handshake: %v", err)
+	}
+
+	conn := &bufferConn{}
+	err = h.handleReflexMagic(
+		bufio.NewReader(bytes.NewReader(packet.Bytes())),
+		conn,
+		&testDispatcher{},
+		context.Background(),
+	)
+	if err == nil {
+		t.Fatal("expected timestamp validation error")
+	}
+	if !strings.Contains(err.Error(), "timestamp out of range") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(conn.String(), "403 Forbidden") ||
+		!strings.Contains(conn.String(), "invalid timestamp") {
+		t.Fatal("expected 403 invalid timestamp response")
+	}
+}
+
+func TestReadClientHandshakeMagicOversizedPolicyLength(t *testing.T) {
+	h := createTestHandler()
+
+	var packet bytes.Buffer
+	magic := make([]byte, 4)
+	binary.BigEndian.PutUint32(magic, ReflexMagic)
+	packet.Write(magic)
+	packet.Write(make([]byte, 32)) // public key
+	packet.Write(make([]byte, 16)) // user id
+
+	ts := make([]byte, 8)
+	binary.BigEndian.PutUint64(ts, uint64(time.Now().Unix()))
+	packet.Write(ts)
+	packet.Write(make([]byte, 16)) // nonce
+
+	// >= MaxHandshakeSize should skip policy read branch.
+	policyLen := make([]byte, 2)
+	binary.BigEndian.PutUint16(policyLen, MaxHandshakeSize)
+	packet.Write(policyLen)
+	packet.Write(bytes.Repeat([]byte{0xAA}, 8)) // trailing bytes should remain unread
+
+	hs, err := h.readClientHandshakeMagic(bufio.NewReader(bytes.NewReader(packet.Bytes())))
+	if err != nil {
+		t.Fatalf("unexpected read error: %v", err)
+	}
+	if len(hs.PolicyReq) != 0 {
+		t.Fatalf("policy request should be skipped for oversized length, got %d bytes", len(hs.PolicyReq))
+	}
+}
+
+func TestHandleSessionControlFramesAndClose(t *testing.T) {
+	h := createTestHandler()
+	key := bytes.Repeat([]byte{0x7F}, 32)
+	writerSession, err := NewSession(key)
+	if err != nil {
+		t.Fatalf("failed to create writer session: %v", err)
+	}
+
+	var stream bytes.Buffer
+	if err := writerSession.WriteFrame(&stream, FrameTypePadding, []byte{0x00, 0x20}); err != nil {
+		t.Fatalf("failed to write padding frame: %v", err)
+	}
+	if err := writerSession.WriteFrame(&stream, FrameTypeTiming, make([]byte, 8)); err != nil {
+		t.Fatalf("failed to write timing frame: %v", err)
+	}
+	if err := writerSession.WriteFrame(&stream, FrameTypeClose, nil); err != nil {
+		t.Fatalf("failed to write close frame: %v", err)
+	}
+
+	err = h.handleSession(
+		context.Background(),
+		bufio.NewReader(bytes.NewReader(stream.Bytes())),
+		&bufferConn{},
+		&testDispatcher{},
+		key,
+		h.clients[0],
+		GetProfileByName("youtube"),
+	)
+	if err != nil {
+		t.Fatalf("expected control-frame session to close cleanly: %v", err)
 	}
 }
 

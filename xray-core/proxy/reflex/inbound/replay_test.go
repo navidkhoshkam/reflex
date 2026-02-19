@@ -1,120 +1,112 @@
 package inbound
 
 import (
+	"bufio"
 	"bytes"
-	"net"
+	"context"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
 )
 
-func TestReplayProtection(t *testing.T) {
-	session, err := createTestSession()
+func TestReplayProtectionRejectsReplayedFrame(t *testing.T) {
+	key := bytes.Repeat([]byte{0xAB}, 32)
+	writerSession, err := NewSession(key)
 	if err != nil {
-		t.Fatalf("failed to create session: %v", err)
+		t.Fatalf("failed to create writer session: %v", err)
+	}
+	readerSession, err := NewSession(key)
+	if err != nil {
+		t.Fatalf("failed to create reader session: %v", err)
 	}
 
 	testData := []byte("test data")
-
-	// First frame - should succeed
-	clientConn1, serverConn1 := net.Pipe()
-	defer clientConn1.Close()
-	defer serverConn1.Close()
-
-	go func() {
-		defer clientConn1.Close()
-		_ = session.WriteFrame(clientConn1, FrameTypeData, testData)
-	}()
-
-	frame1, err := session.ReadFrame(serverConn1)
-	if err != nil {
-		t.Fatalf("first frame should succeed: %v", err)
+	var wire bytes.Buffer
+	if err := writerSession.WriteFrame(&wire, FrameTypeData, testData); err != nil {
+		t.Fatalf("failed to write frame: %v", err)
 	}
+	raw := wire.Bytes()
 
+	// First read with nonce=0 should succeed.
+	frame1, err := readerSession.ReadFrame(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatalf("first read should succeed: %v", err)
+	}
 	if !bytes.Equal(frame1.Payload, testData) {
-		t.Fatal("first frame payload mismatch")
+		t.Fatal("payload mismatch on first read")
 	}
 
-	// Note: In our current implementation, nonces are sequential
-	// A true replay attack would use the same nonce, which would fail
-	// because nonces increment. However, we can test that using the same
-	// nonce value would fail decryption.
-
-	// Test that nonces are different
-	clientConn2, serverConn2 := net.Pipe()
-	defer clientConn2.Close()
-	defer serverConn2.Close()
-
-	go func() {
-		defer clientConn2.Close()
-		_ = session.WriteFrame(clientConn2, FrameTypeData, testData)
-	}()
-
-	frame2, err := session.ReadFrame(serverConn2)
-	if err != nil {
-		t.Fatalf("second frame should succeed: %v", err)
+	// Replaying the exact same ciphertext should fail because reader nonce advanced to 1.
+	if _, err := readerSession.ReadFrame(bytes.NewReader(raw)); err == nil {
+		t.Fatal("expected replayed frame decryption to fail")
 	}
-
-	// Both frames should decrypt successfully with different nonces
-	if !bytes.Equal(frame2.Payload, testData) {
-		t.Fatal("second frame payload mismatch")
-	}
-
-	// The nonces are different (tested implicitly by successful decryption)
-	// If we tried to reuse a nonce, decryption would fail
 }
 
-func TestNonceUniqueness(t *testing.T) {
-	session, err := createTestSession()
+func TestNonceUniquenessMonotonicCounters(t *testing.T) {
+	key := bytes.Repeat([]byte{0xCD}, 32)
+	writerSession, err := NewSession(key)
 	if err != nil {
-		t.Fatalf("failed to create session: %v", err)
+		t.Fatalf("failed to create writer session: %v", err)
+	}
+	readerSession, err := NewSession(key)
+	if err != nil {
+		t.Fatalf("failed to create reader session: %v", err)
 	}
 
-	// Write multiple frames and verify they all decrypt correctly
-	// This tests that nonces are unique and sequential
-	numFrames := 10
-	testData := []byte("test")
-
+	numFrames := 8
+	var wire bytes.Buffer
 	for i := 0; i < numFrames; i++ {
-		clientConn, serverConn := net.Pipe()
+		payload := []byte{byte(i)}
+		if err := writerSession.WriteFrame(&wire, FrameTypeData, payload); err != nil {
+			t.Fatalf("failed to write frame %d: %v", i, err)
+		}
+	}
 
-		go func() {
-			defer clientConn.Close()
-			_ = session.WriteFrame(clientConn, FrameTypeData, testData)
-		}()
-
-		frame, err := session.ReadFrame(serverConn)
+	reader := bytes.NewReader(wire.Bytes())
+	for i := 0; i < numFrames; i++ {
+		frame, err := readerSession.ReadFrame(reader)
 		if err != nil {
-			t.Fatalf("frame %d should succeed: %v", i, err)
+			t.Fatalf("failed to read frame %d: %v", i, err)
 		}
-
-		if !bytes.Equal(frame.Payload, testData) {
-			t.Fatalf("frame %d payload mismatch", i)
+		if len(frame.Payload) != 1 || frame.Payload[0] != byte(i) {
+			t.Fatalf("payload mismatch for frame %d", i)
 		}
+	}
 
-		clientConn.Close()
-		serverConn.Close()
+	if writerSession.writeNonce != uint64(numFrames) {
+		t.Fatalf("unexpected writer nonce: got %d want %d", writerSession.writeNonce, numFrames)
+	}
+	if readerSession.readNonce != uint64(numFrames) {
+		t.Fatalf("unexpected reader nonce: got %d want %d", readerSession.readNonce, numFrames)
 	}
 }
 
-func TestTimestampValidation(t *testing.T) {
-	_ = createTestHandler()
-
-	// Test with current timestamp (should be valid)
-	now := time.Now().Unix()
-	if now < now-300 || now > now+300 {
-		t.Fatal("current timestamp should be valid")
+func TestTimestampValidationInProcessHandshake(t *testing.T) {
+	h := createTestHandler()
+	validUser := uuid.MustParse(h.clients[0].Account.(*MemoryAccount).Id)
+	conn := &bufferConn{}
+	hs := &ClientHandshake{
+		UserID:    [16]byte(validUser),
+		Timestamp: time.Now().Unix() - 601,
 	}
 
-	// Test with old timestamp (should be invalid)
-	oldTimestamp := time.Now().Unix() - 600 // 10 minutes ago
-	if oldTimestamp >= now-300 && oldTimestamp <= now+300 {
-		t.Fatal("old timestamp should be invalid")
+	err := h.processHandshake(
+		bufio.NewReader(bytes.NewReader(nil)),
+		conn,
+		&testDispatcher{},
+		context.Background(),
+		hs,
+	)
+	if err == nil {
+		t.Fatal("expected timestamp validation error")
 	}
-
-	// Test with future timestamp (should be invalid)
-	futureTimestamp := time.Now().Unix() + 600 // 10 minutes in future
-	if futureTimestamp >= now-300 && futureTimestamp <= now+300 {
-		t.Fatal("future timestamp should be invalid")
+	if !strings.Contains(err.Error(), "timestamp out of range") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !bytes.Contains(conn.Bytes(), []byte("403 Forbidden")) ||
+		!bytes.Contains(conn.Bytes(), []byte("invalid timestamp")) {
+		t.Fatal("expected 403 response with invalid timestamp message")
 	}
 }
-
